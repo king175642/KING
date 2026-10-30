@@ -1,0 +1,5 @@
+LengthRank	AvgOveruseRate	SampleCount
+1	1.833567	13574
+2	0.882612	23116
+3	0.592436	17301
+4	0.490956	3045

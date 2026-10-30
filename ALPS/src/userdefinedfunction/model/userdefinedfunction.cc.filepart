@@ -1,0 +1,721 @@
+/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
+
+#include "userdefinedfunction.h"
+
+namespace ns3
+{
+
+  NS_LOG_COMPONENT_DEFINE("userdefinedfunction");
+  // Conga LB seting
+  std::map<Ipv4Address, uint32_t> routeSettings::hostIp2IdMap;
+  std::map<uint32_t, Ipv4Address> routeSettings::hostId2IpMap;
+  std::map<Ipv4Address, uint32_t> routeSettings::hostIp2SwitchId;
+  std::map<uint32_t, std::vector<Ipv4Address>> routeSettings::ToRSwitchId2hostIp;
+  std::map<Ipv4Address, uint32_t> routeSettings::ip2IdMap;
+
+
+  void add_channel_between_two_nodes(Ptr<Node> firstNode, Ptr<Node> secondNode, PointToPointHelper &p2p)
+  {
+    NodeContainer nodes;
+    nodes.Add(firstNode);
+    nodes.Add(secondNode);
+    p2p.Install(nodes);
+  }
+
+  uint32_t add_channels(NodeContainer &allNodes, std::map<uint32_t, CHL_entry_t> &CHL)
+  {
+    uint32_t channelCnt = CHL.size();
+    uint32_t installChannelCnt = 0;
+    for (uint32_t i = 0; i < channelCnt; i++)
+    {
+      CHL_entry_t channelEntry = CHL[i];
+      uint32_t srcNodeIdx = channelEntry.srcNodeIdx;
+      Ptr<Node> srcNode = allNodes.Get(srcNodeIdx);
+      uint32_t dstNodeIdx = channelEntry.dstNodeIdx;
+      Ptr<Node> dstNode = allNodes.Get(dstNodeIdx);
+      PointToPointHelper p2p = set_P2P_attribute(channelEntry.widthInGbps,
+                                                 channelEntry.delayInUs,
+                                                 channelEntry.queueType,
+                                                 channelEntry.queueSize);
+      add_channel_between_two_nodes(srcNode, dstNode, p2p);
+      installChannelCnt = installChannelCnt + 1;
+    }
+    return installChannelCnt;
+  }
+
+  void assign_address_to_single_device(Ipv4Address network, Ipv4Mask mask, Ipv4Address base, Ptr<NetDevice> device)
+  {
+    Ipv4AddressHelper address;
+    NetDeviceContainer devs(device);
+    address.SetBase(network, mask, base);
+    address.Assign(devs);
+    return;
+  }
+
+  uint32_t assign_addresses_to_devices(std::map<uint32_t, std::map<uint32_t, addr_entry_t>> &ADDR, NodeContainer &nodes)
+  {
+    uint32_t addrCnt = 0;
+    uint32_t nodeCnt = nodes.GetN();
+    Ipv4AddressHelper address;
+    for (uint32_t nodeIdx = 0; nodeIdx < nodeCnt; nodeIdx++)
+    {
+      Ptr<Node> curNode = nodes.Get(nodeIdx);
+      std::map<uint32_t, std::map<uint32_t, addr_entry_t>>::iterator it_0 = ADDR.find(nodeIdx);
+      if (it_0 == ADDR.end())
+      {
+        std::cout << "ERROR! assign_addresses_to_devices() with Node Index: " << nodeIdx << std::endl;
+        return 0;
+      }
+      std::map<uint32_t, addr_entry_t> nodeADDR = it_0->second;
+      uint32_t devCnt = curNode->GetNDevices();
+      // std::cout << "Node "<< nodeIdx << " has " << devCnt-1 << " user-added devices and "<< nodeADDR.size() << " input addresses" << std::endl;
+      for (uint32_t devIdx = 1; devIdx < devCnt; devIdx++)
+      {
+        Ptr<NetDevice> curDev = curNode->GetDevice(devIdx);
+        if (curDev == 0)
+        {
+          std::cout << "ERROR! cannot get the device for node=" << nodeIdx << " and deviceIdx=" << devIdx << std::endl;
+          return 0;
+        }
+        std::map<uint32_t, addr_entry_t>::iterator it_1 = nodeADDR.find(devIdx);
+        if (it_1 == nodeADDR.end())
+        {
+          std::cout << "ERROR! assign_addresses_to_devices() Error with Device Index: " << nodeIdx << ", " << devIdx << std::endl;
+          return 0;
+        }
+        assign_address_to_single_device(it_1->second.network, it_1->second.mask, it_1->second.base, curDev);
+        addrCnt = addrCnt + 1;
+      }
+    }
+    return addrCnt;
+  }
+
+  void record_addr_on_single_node(Ptr<Node> node, std::map<Ipv4Address, Ptr<Node>> &addr2node)
+  {
+    auto ipv4 = node->GetObject<Ipv4>();
+    auto nicCnt = ipv4->GetNInterfaces();
+    for (uint32_t i = 1; i < nicCnt; i++)
+    {
+      auto addr = ipv4->GetAddress(i, 0).GetLocal();
+      addr2node[addr] = node;
+      // routeSettings::ip2IdMap[addr] = node->GetId();
+    }
+    return;
+  }
+  void assign_addresses(NodeContainer &nodes, std::map<Ipv4Address, Ptr<Node>> &addr2node)
+  {
+    uint32_t nodeCnt = nodes.GetN();
+    for (uint32_t nodeIdx = 0; nodeIdx < nodeCnt; nodeIdx++)
+    {
+      Ptr<Node> curNode = nodes.Get(nodeIdx);
+      assign_rdma_addresses_to_node(curNode);
+      record_addr_on_single_node(curNode, addr2node);
+    }
+    return;
+  }
+  void assign_node_addresses(global_variable_t *varMap)
+  {
+    NodeContainer nodes = varMap->allNodes;
+    uint32_t nodeCnt = nodes.GetN();
+    for (uint32_t nodeIdx = 0; nodeIdx < nodeCnt; nodeIdx++)
+    {
+      Ptr<Node> curNode = nodes.Get(nodeIdx);
+      assign_rdma_addresses_to_node(curNode);
+      record_save_addr_on_single_node(curNode, varMap->addr2node, varMap->paraMap);
+
+      if (curNode->GetNodeType() == SERVER_NODE_TYPE)
+      { // is server node
+        auto ipv4addr = curNode->GetObject<Ipv4>()->GetAddress(1, 0).GetLocal();
+        routeSettings::hostIp2IdMap[ipv4addr] = curNode->GetId();
+        update_EST(varMap->paraMap, "hostIp2IdMap: " + ipv4Address_to_string(ipv4addr), curNode->GetId());
+        for (std::map<Ptr<Node>, std::vector<edge_t>>::iterator it = varMap->edges[curNode].begin(); it != varMap->edges[curNode].end(); ++it)
+        {
+          // host-switch link
+          if (it->first->GetNodeType() == SWITCH_NODE_TYPE)
+          {
+            routeSettings::hostIp2SwitchId[ipv4addr] = it->first->GetId();
+
+            update_EST(varMap->paraMap, "hostIp2SwitchId: " + ipv4Address_to_string(ipv4addr), it->first->GetId());
+            routeSettings::ToRSwitchId2hostIp[it->first->GetId()].push_back(ipv4addr);
+          }
+        }
+      }
+    }
+    std::cout << ":hostIp2IdMap: " << map_to_string<Ipv4Address, uint32_t>(routeSettings::hostIp2IdMap) << std::endl;
+    std::cout << ":hostIp2SwitchId: " << map_to_string<Ipv4Address, uint32_t>(routeSettings::hostIp2SwitchId) << std::endl;
+    return;
+  }
+  void record_save_addr_on_single_node(Ptr<Node> node, std::map<Ipv4Address, Ptr<Node>> &addr2node, std::map<uint32_t, est_entry_t> &paraMap)
+  {
+    auto ipv4 = node->GetObject<Ipv4>();
+    auto nicCnt = ipv4->GetNInterfaces();
+    for (uint32_t i = 1; i < nicCnt; i++)
+    {
+      auto addr = ipv4->GetAddress(i, 0).GetLocal();
+      update_EST(paraMap, "node: " + std::to_string(node->GetId()) + "interface: " + std::to_string(i), addr);
+      addr2node[addr] = node;
+    }
+    return;
+  }
+  NetDeviceContainer get_all_netdevices_of_a_node(Ptr<Node> node)
+  {
+    NetDeviceContainer c;
+    uint32_t devCnt = node->GetNDevices();
+    for (uint32_t devIdx = 1; devIdx < devCnt; devIdx++)
+    {
+      Ptr<NetDevice> curDev = node->GetDevice(devIdx);
+      c.Add(curDev);
+    }
+    return c;
+  }
+
+  void assign_rdma_addresses_to_node(Ptr<Node> node)
+  {
+    // std::string msk = "255.255.255.0"
+    Ipv4Mask msk("255.255.255.0");
+    Ipv4Address base = string_to_ipv4Address("0.0.0.1");
+    Ipv4Address ntwk(0x0b000000 + ((node->GetId() / 256) * 0x00010000) + ((node->GetId() % 256) * 0x00000100));
+    NetDeviceContainer devs = get_all_netdevices_of_a_node(node);
+    Ipv4AddressHelper hlpr;
+    hlpr.SetBase(ntwk, msk, base);
+    hlpr.Assign(devs);
+    return;
+  }
+
+  /* get average value of CDF distribution */
+  double avg_cdf(struct cdf_table *table)
+  {
+    int i = 0;
+    double avg = 0;
+    double value, prob;
+    if (!table)
+      return 0;
+    for (i = 0; i < table->num_entry; i++)
+    {
+      if (i == 0)
+      {
+        value = table->entries[i].value / 2;
+        prob = table->entries[i].cdf;
+      }
+      else
+      {
+        value = (table->entries[i].value + table->entries[i - 1].value) / 2;
+        prob = table->entries[i].cdf - table->entries[i - 1].cdf;
+      }
+      avg += (value * prob);
+    }
+    return avg;
+  }
+
+  /*bool cmp_pitEntry_in_increase_order_of_latency(const PathData *lhs, const PathData *rhs)
+  {
+    return lhs->latency < rhs->latency; // 升序排列
+  }
+
+  bool cmp_pitEntry_in_decrease_order_of_priority(const PathData *lhs, const PathData *rhs)
+  {
+    return lhs->priority > rhs->priority; // 降序排列
+  }
+
+  bool cmp_pitEntry_in_increase_order_of_Generation_time(const PathData *lhs, const PathData *rhs)
+  {
+    return lhs->tsGeneration < rhs->tsGeneration; // 升序排列
+  }
+
+  bool cmp_pitEntry_in_increase_order_of_congestion_Degree(const PathData *lhs, const PathData *rhs)
+  {
+    return lhs->pathDre < rhs->pathDre; // 升序排列
+  }
+
+  bool cmp_pitEntry_in_increase_order_of_Sent_time(const PathData *lhs, const PathData *rhs)
+  {
+    return lhs->tsLatencyLastSend < rhs->tsLatencyLastSend; // 升序排列
+  }*/
+
+  std::string construct_target_string(uint32_t strLen, std::string c)
+  {
+    std::string result;
+    for (uint32_t i = 0; i < strLen; ++i)
+    {
+      result = result + c;
+    }
+    return result;
+  }
+
+  uint32_t create_topology(NodeContainer &switchNodes, NodeContainer &serverNodes, NodeContainer &allNodes, uint32_t switchNum, uint32_t serverNum)
+  {
+    switchNodes.Create(switchNum);
+    serverNodes.Create(serverNum);
+    allNodes.Add(switchNodes);
+    allNodes.Add(serverNodes);
+    return allNodes.GetN();
+  }
+
+  void free_cdf(struct cdf_table *table)
+  {
+    if (table)
+      free(table->entries);
+  }
+
+  /* generate a random value based on CDF distribution */
+  double gen_random_cdf(struct cdf_table *table)
+  {
+    int i = 0;
+    double x = rand_range(table->min_cdf, table->max_cdf);
+    if (!table)
+      return 0;
+    for (i = 0; i < table->num_entry; i++)
+    {
+      if (x <= table->entries[i].cdf)
+      {
+        if (i == 0)
+          return interpolate(x, 0, 0, table->entries[i].cdf, table->entries[i].value);
+        else
+          return interpolate(x, table->entries[i - 1].cdf, table->entries[i - 1].value, table->entries[i].cdf, table->entries[i].value);
+      }
+    }
+    return table->entries[table->num_entry - 1].value;
+  }
+
+  uint32_t hashing_flow_with_5_tuple(Ptr<const Packet> packet, const Ipv4Header &header)
+  {
+    uint32_t flowId = 0;
+    Hasher m_hasher;
+    m_hasher.clear();
+    TcpHeader tcpHeader;
+    packet->PeekHeader(tcpHeader);
+    std::ostringstream oss;
+    oss << header.GetSource() << " ";
+    oss << header.GetDestination() << " ";
+    oss << header.GetProtocol() << " ";
+    oss << tcpHeader.GetSourcePort() << " ";
+    oss << tcpHeader.GetDestinationPort();
+    std::string data = oss.str();
+    flowId = m_hasher.GetHash32(data);
+    return flowId;
+
+    // uint32_t flowId = 0;
+    // TcpHeader tcpHeader;
+    // packet->PeekHeader(tcpHeader);
+
+    // // 这是一个更简化的TCP头，我们需要手动解�?
+    // Ipv4Address srcAddr, dstAddr;
+    // srcAddr = header.GetSource();
+    // dstAddr = header.GetDestination();
+    // uint8_t protocol = header.GetProtocol();
+    // uint16_t sourcePort, destinationPort;
+    // if(packet->GetSize() >= 12) { // minimal ack packet
+    //   uint8_t buffer[12];
+    //   packet->CopyData(buffer, 12);
+    //   sourcePort = (buffer[0] << 8) + buffer[1];
+    //   destinationPort = (buffer[2] << 8) + buffer[3];
+    // }else{
+    //   std::cout << "Error in packet size with TCP header without IP header! size = " <<  packet->GetSize() << std::endl;
+    // }
+
+    // Hasher m_hasher;
+    // m_hasher.clear();
+    // std::cout << "Header INFO: " << std::endl;
+    // NS_LOG_INFO("header.GetSource(): " << srcAddr);
+    // NS_LOG_INFO("header.GetDestination(): " << dstAddr);
+    // NS_LOG_INFO("header.GetProtocol(): " << protocol);
+    // NS_LOG_INFO("tcpHeader.GetDestinationPort(): " << sourcePort);
+    // NS_LOG_INFO("tcpHeader.GetSourcePort(): " << destinationPort);
+
+    // std::ostringstream oss;
+    // oss << srcAddr << dstAddr << header.GetSource() << protocol << sourcePort << destinationPort;//获取源ip、目的ip、传输层协议
+    // std::string data = oss.str();
+    // flowId = m_hasher.GetHash32(data);
+    // return flowId;
+  }
+
+  std::string hashing_flow_with_5_tuple_to_string(Ptr<const Packet> packet, const Ipv4Header &header)
+  {
+    Hasher m_hasher;
+    m_hasher.clear();
+    TcpHeader tcpHeader;
+    packet->PeekHeader(tcpHeader);
+    std::ostringstream oss;
+    oss << header.GetSource() << " ";
+    oss << header.GetDestination() << " ";
+    oss << header.GetProtocol() << " ";
+    oss << tcpHeader.GetSourcePort() << " ";
+    oss << tcpHeader.GetDestinationPort();
+    std::string data = oss.str();
+    return data;
+  }
+
+  void init_cdf(struct cdf_table *table)  {
+    NS_LOG_FUNCTION(TG_CDF_TABLE_ENTRY);
+    NS_ASSERT_MSG(table != NULL, "CDF_Table is NULL");
+    table->entries = (struct cdf_entry *)malloc(TG_CDF_TABLE_ENTRY * sizeof(struct cdf_entry));
+    table->num_entry = 0;
+    table->max_entry = TG_CDF_TABLE_ENTRY;
+    table->min_cdf = 0;
+    table->max_cdf = 1;
+    NS_ASSERT_MSG((table->entries) != NULL, "Error in mallocating entries");
+    return;
+  }
+
+  void install_flow_in_tcp_bulk_on_node_pair(Ptr<Node> srcServerNode, Ptr<Node> dstServerNode, uint16_t port, uint32_t flowSize,
+                                             uint32_t packetSize, double startTime, double endTime)
+  {
+    Ptr<Ipv4> ipv4 = dstServerNode->GetObject<Ipv4>();
+    Ipv4InterfaceAddress dstInterface = ipv4->GetAddress(1, 0);
+    Ipv4Address dstAddress = dstInterface.GetLocal();
+    BulkSendHelper source("ns3::TcpSocketFactory", InetSocketAddress(dstAddress, port));
+    source.SetAttribute("MaxBytes", UintegerValue(flowSize));
+    source.SetAttribute("SendSize", UintegerValue(packetSize));
+    ApplicationContainer sourceApp = source.Install(srcServerNode);
+    sourceApp.Start(Seconds(startTime));
+    sourceApp.Stop(Seconds(endTime));
+    PacketSinkHelper sink("ns3::TcpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), port));
+    ApplicationContainer sinkApp = sink.Install(dstServerNode);
+    sinkApp.Start(Seconds(startTime));
+    sinkApp.Stop(Seconds(endTime));
+  }
+
+  void install_flows_in_tcp_bulk_on_node_pair(Ptr<Node> srcServerNode, Ptr<Node> dstServerNode,
+                                              double requestRate, struct cdf_table *cdfTable, long &flowCount, long &totalFlowSize,
+                                              double START_TIME, double END_TIME, double FLOW_LAUNCH_END_TIME,
+                                              uint16_t &appPort, uint32_t &smallFlowCount, uint32_t &largeFlowCount)
+  {
+    double startTime = START_TIME + poission_gen_interval(requestRate); // possion distribution of start time
+    while (startTime < FLOW_LAUNCH_END_TIME)
+    {
+      // std::cout << "startTime :" << startTime << ", FLOW_LAUNCH_END_TIME : " << FLOW_LAUNCH_END_TIME << ", END_TIME : " << END_TIME;
+      uint32_t flowSize = gen_random_cdf(cdfTable);
+      install_tcp_bulk_on_node_pair(srcServerNode, dstServerNode, appPort, flowSize, startTime, END_TIME);
+      startTime += poission_gen_interval(requestRate);
+      appPort = appPort + 1;
+      totalFlowSize += flowSize;
+      flowCount = flowCount + 1;
+      if (flowSize <= THRESHOLD_IN_BYTE_FOR_SMALL_FLOW)
+      {
+        smallFlowCount++;
+      }
+      else if (flowSize > THRESHOLD_IN_BYTE_FOR_LARGE_FLOW)
+      {
+        largeFlowCount++;
+      }
+    }
+  }
+
+  void addTcpSocketBaseBxCb(Ptr<PacketSink> sink, std::string fid, std::map<std::string, reorderDistEntry> *reorderDistTbl)
+  {
+    NS_LOG_FUNCTION("addTcpSocketBaseBxCb()");
+    if (sink == 0)
+    {
+      std::cout << "Error with null packet sink pointer in addTcpSocketBaseBxCb()" << std::endl;
+      return;
+    }
+    Ptr<Socket> skt = sink->GetListeningSocket();
+    Ptr<TcpSocketBase> skt2 = DynamicCast<TcpSocketBase>(skt);
+    if (skt2 == 0)
+    {
+      std::cout << "Error with null packet TcpSocketBase pointer in addTcpSocketBaseBxCb()" << std::endl;
+      return;
+    }
+    NS_LOG_LOGIC("At time " << Now() << ", Adding trace function for reorder statistics at receiver end for flow " << fid);
+    skt2->TraceConnectWithoutContext("Bx", MakeBoundCallback(&tcpSocketBaseBxCb, fid, reorderDistTbl));
+    // Config::ConnectWithoutContext ("/NodeList/*/$ns3::TcpL4Protocol/SocketList/*/Bx", MakeBoundCallback (&tcpSocketBaseBxCb, reorderDistTbl));
+  }
+
+  void install_tcp_bulk_on_node_pair(Ptr<Node> srcServerNode, Ptr<Node> dstServerNode, uint16_t port, uint32_t flowSize, double START_TIME, double END_TIME)
+  {
+    Ptr<Ipv4> ipv4 = dstServerNode->GetObject<Ipv4>();
+    Ipv4InterfaceAddress dstInterface = ipv4->GetAddress(1, 0);
+    Ipv4Address dstAddress = dstInterface.GetLocal();
+    BulkSendHelper source("ns3::TcpSocketFactory", InetSocketAddress(dstAddress, port));
+    source.SetAttribute("MaxBytes", UintegerValue(flowSize));
+    ApplicationContainer sourceApp = source.Install(srcServerNode);
+    sourceApp.Start(Seconds(START_TIME));
+    sourceApp.Stop(Seconds(END_TIME));
+    std::string flowId = std::to_string(srcServerNode->GetId()) + "-" + std::to_string(dstServerNode->GetId()) + "-" + std::to_string(port);
+    sourceApp.Get(0)->TraceConnect("AppStart", flowId, MakeCallback(&BulkSendApplication::StartNotification, DynamicCast<BulkSendApplication>(sourceApp.Get(0))));
+    sourceApp.Get(0)->TraceConnect("AppComplete", flowId, MakeCallback(&BulkSendApplication::CompleteNotification, DynamicCast<BulkSendApplication>(sourceApp.Get(0))));
+
+    PacketSinkHelper sink("ns3::TcpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), port));
+    ApplicationContainer sinkApp = sink.Install(dstServerNode);
+    sinkApp.Start(Seconds(START_TIME));
+    sinkApp.Stop(Seconds(END_TIME));
+
+    Ptr<PacketSink> sinkPtr = DynamicCast<PacketSink>(sinkApp.Get(0));
+    Simulator::Schedule(Seconds(START_TIME + 0.000000001), &addTcpSocketBaseBxCb, sinkPtr, flowId, &BulkSendApplication::reorderDistTbl);
+
+    // Ptr<PacketSink> sink = DynamicCast<PacketSink> (sinkApp.Get (0));
+    // source->TraceConnectWithoutContext ("Tx", MakeCallback (&BulkSendBasicTestCase::SendTx, this));
+
+    return;
+  }
+
+  void install_rdma_client_on_single_node(Ptr<Node> node, flow_entry_t &f)
+  {
+    RdmaClientHelper rdmaClientHelper(f.prioGroup, f.srcAddr, f.srcAddr, f.srcPort, f.dstPort, f.byteCnt, f.winInByte, f.rttInNs);
+    rdmaClientHelper.SetAttribute("StatFlowID", IntegerValue(f.idx));
+    ApplicationContainer rdmaClient = rdmaClientHelper.Install(node);
+    rdmaClient.Start(NanoSeconds(f.startTimeInSec));
+    return;
+  }
+
+  void install_rdma_client_on_node(global_variable_t *varMap, uint32_t srcNodeId, uint32_t dstNodeId, uint32_t flownum, uint64_t flowByte, uint16_t port)
+  {
+    // RdmaClientHelper rdmaClientHelper(f.prioGroup, f.srcAddr, f.srcAddr, f.srcPort, f.dstPort, f.byteCnt, f.winInByte, f.rttInNs);
+    // ApplicationContainer rdmaClient = rdmaClientHelper.Install(node);
+    // rdmaClient.Start(NanoSeconds(f.startTimeInSec));
+    Ptr<Node> srcnode = varMap->allNodes.Get(srcNodeId);
+    NS_ASSERT_MSG(srcnode->GetNodeType() == SERVER_NODE_TYPE, "Error in installing rdma on wrong source node");
+    Ptr<Node> dstnode = varMap->allNodes.Get(dstNodeId);
+    NS_ASSERT_MSG(dstnode->GetNodeType() == SERVER_NODE_TYPE, "Error in installing rdma on wrong dst node");
+
+    // 获取源节点的第一个接口的IPv4地址
+    Ptr<Ipv4> srcipv4_1 = srcnode->GetObject<Ipv4>();
+    // uint32_t srcinterfaceIndex_1 = interfaces.GetInterfaceIndex(srcnode, 0);
+    Ipv4Address srcipAddr1 = srcipv4_1->GetAddress(1, 0).GetLocal();
+    // 获取目的节点的第一个接口的IPv4地址
+    Ptr<Ipv4> dstipv4_1 = dstnode->GetObject<Ipv4>();
+    // uint32_t dstinterfaceIndex_1 = interfaces.GetInterfaceIndex(dstnode, 0);
+    Ipv4Address dstipAddr1 = dstipv4_1->GetAddress(1, 0).GetLocal();
+    flow_entry_t flowEntry;
+    flowEntry.idx = varMap->flowCount++;
+    flowEntry.prioGroup = 3;
+    flowEntry.srcAddr = srcipAddr1;
+    flowEntry.dstAddr = dstipAddr1;
+    flowEntry.srcPort = port;
+    flowEntry.dstPort = port;
+    flowEntry.byteCnt = flowByte;
+    flowEntry.winInByte = varMap->maxBdpInByte;
+    flowEntry.rttInNs = varMap->maxRttInNs;
+    flowEntry.startTimeInSec = varMap->simStartTimeInSec;
+    RdmaClientHelper rdmaClientHelper(flowEntry.prioGroup, flowEntry.srcAddr, flowEntry.dstAddr, flowEntry.srcPort, flowEntry.dstPort, flowEntry.byteCnt, flowEntry.winInByte, flowEntry.rttInNs);
+    rdmaClientHelper.SetAttribute("StatFlowID", IntegerValue(flowEntry.idx));
+
+    ApplicationContainer rdmaClient = rdmaClientHelper.Install(srcnode);
+    rdmaClient.Start(NanoSeconds(flowEntry.startTimeInSec));
+
+    update_EST(varMap->paraMap, "MaxWinInByte", varMap->maxBdpInByte);
+    update_EST(varMap->paraMap, "MaxRttInNs", 1.0*varMap->maxRttInNs/1000);
+
+    return;
+  }
+
+  void qp_finish(FILE *os, global_variable_t *m, Ptr<RdmaQueuePair> q)
+  {
+    // sip, dip, sport, dport, dataSize (B), trafficSize,
+    // start_time, last_time, cur_time, fct (ns), standalone_fct (ns)
+    auto srcIpAddr = q->sip;
+    NS_ABORT_MSG_UNLESS(m->addr2node.find(srcIpAddr) != m->addr2node.end(), "key not save, srcIpAddr " + ipv4Address_to_string(srcIpAddr));
+    /*if (m->addr2node.find(srcIpAddr) != m->addr2node.end())
+    {
+      std::cout << "key is save, srcIpAddr " << ipv4Address_to_string(srcIpAddr);
+    }
+    else
+    {
+      std::cout << "key not save, srcIpAddr " << ipv4Address_to_string(srcIpAddr);
+    }*/
+    auto srcNode = m->addr2node[srcIpAddr];
+
+    auto dstIpAddr = q->dip;
+    /*
+    if (m->addr2node.find(dstIpAddr) != m->addr2node.end())
+    {
+      std::cout << "key is save, dstIpAddr " << ipv4Address_to_string(dstIpAddr) << " m->addr2node size is" << m->addr2node.size() << std::endl;
+    }
+    else
+    {
+      std::cout << "key not save, dstIpAddr " << ipv4Address_to_string(dstIpAddr) << " m->addr2node size is" << m->addr2node.size() << std::endl;
+    }*/
+    NS_ABORT_MSG_UNLESS(m->addr2node.find(dstIpAddr) != m->addr2node.end(), "key not save, dstIpAddr " + ipv4Address_to_string(dstIpAddr));
+    auto dstNode = m->addr2node[dstIpAddr];
+    // std::cout << "qp_finish: " << "srcIpAddr" << ipv4Address_to_string(srcIpAddr) << "dstIpAddr" << ipv4Address_to_string(dstIpAddr) << std::endl;
+    // uint64_t baseRttInNs = m->pairRttInNs[srcNode][dstNode];
+    // uint64_t bitWdithPerSec = m->pairBwInBitps[srcNode][dstNode];
+    uint32_t totalBytes = q->m_size + ((q->m_size - 1) / m->defaultPktSizeInByte + 1) * (CustomHeader::GetStaticWholeHeaderSize() - IntHeader::GetStaticSize()); // translate to the minimum bytes required (with header but no INT)
+    // std::cout << "srcNodeID: " << srcNode->GetId() << "dstnodeID: " << dstNode->GetId() << ",bitWdithPerSec" << bitWdithPerSec << std::endl;
+    // uint64_t baseFctInNs = baseRttInNs + totalBytes * 8000000000lu / bitWdithPerSec;
+    uint32_t flowId = q->m_flow_id;
+    RdmaHw::m_recordQpExec[flowId].finishTime = Simulator::Now().GetNanoSeconds();
+
+    fprintf(os, "SIP:%08x DIP:%08x SP:%u DP:%u DataSizeInByte:%lu PktSizeInByte:%u SendPktSizeInByte:%lu StartTimeInNs:%lu LastTimeInNs:%lu EndTimeInNs:%lu BaseFctInNs:%ld\n",
+            q->sip.Get(),
+            q->dip.Get(),
+            q->sport,
+            q->dport,
+            q->m_size,
+            totalBytes,
+            q->sendDateSize,
+            q->startTime.GetNanoSeconds(),
+            (Simulator::Now() - q->startTime).GetNanoSeconds(),
+            Simulator::Now().GetNanoSeconds()
+            // baseFctInNs
+    );
+    // remove rxQp from the receiver
+    Ptr<RdmaDriver> rdma = dstNode->GetObject<RdmaDriver>();
+    rdma->m_rdma->DeleteRxQp(q->sip.Get(), q->sport, q->dport, q->m_pg);
+  }
+
+  void iterate_single_incast_kv_cache_application(global_variable_t *varMap, uint32_t jobIdx)
+  {
+
+    varMap->kvCachePara[jobIdx].roundCnt += 1;
+    if (varMap->kvCachePara[jobIdx].roundCnt > varMap->kvCachePara[jobIdx].roundNum)
+    {
+      std::cout << "Successfully finish the " << jobIdx << " Job (Incast)" << std::endl;
+      varMap->numOfFinishedJob += 1;
+
+      return;
+    }
+    NS_LOG_INFO("INCAST, JobID: " << jobIdx << ", Round **" << varMap->kvCachePara[jobIdx].roundCnt << "** Starts ");
+
+    varMap->kvCachePara[jobIdx].completeCnt = 0;
+    Ptr<Node> leaderNode = varMap->kvCachePara[jobIdx].leaderNode;
+    Ipv4Address leaderAddr = leaderNode->GetObject<Ipv4>()->GetAddress(1, 0).GetLocal();
+    uint64_t delayInNs, flowSizeInByte;
+    uint16_t appPort;
+    if (varMap->kvCachePara[jobIdx].roundCnt != 1)
+    {
+      delayInNs = varMap->kvCachePara[jobIdx].otherTimeInNs + varMap->kvCachePara[jobIdx].reduceTimeInNs + varMap->kvCachePara[jobIdx].attentionTimeInNs;
+    }
+    else
+    {
+      delayInNs = 0;
+    }
+    for (uint32_t i = 0; i < varMap->kvCachePara[jobIdx].followerNodes.GetN(); i++)
+    {
+      Ptr<Node> followerNode = varMap->kvCachePara[jobIdx].followerNodes.Get(i);
+      Ipv4Address followerAddr = followerNode->GetObject<Ipv4>()->GetAddress(1, 0).GetLocal();
+      varMap->appStartPort += 1;
+      appPort = varMap->appStartPort;
+      varMap->appPort2kvApp[appPort] = &varMap->kvCachePara[jobIdx];
+      flowSizeInByte = varMap->kvCachePara[jobIdx].notifySizeInByte;
+      RdmaClientHelper clientHelper(3, leaderAddr, followerAddr, appPort, appPort, flowSizeInByte, varMap->maxBdpInByte, varMap->maxRttInNs);
+      ApplicationContainer appCon = clientHelper.Install(leaderNode);
+      appCon.Start(NanoSeconds(delayInNs));
+      NS_LOG_INFO("QP Pair Index: " << i << ", " << "Leader-->Follower: Job Index: " << jobIdx << ", " << "Type: " << varMap->kvCachePara[jobIdx].type << ", " << "Round: " << varMap->kvCachePara[jobIdx].roundCnt << ", " << "CompleteCnt: " << varMap->kvCachePara[jobIdx].completeCnt << ", " << "srcNode: " << leaderNode->GetId() << ", " << "DstNode: " << followerNode->GetId() << ", " << "appPort: " << appPort << ", " << "flowSizeInByte: " << flowSizeInByte << ", " << "WaitTimeInNs: " << delayInNs);
+    }
+  }
+
+  void iterate_single_broadcast_kv_cache_application(global_variable_t *varMap, uint32_t jobIdx)
+  {
+
+    varMap->kvCachePara[jobIdx].roundCnt += 1;
+    if (varMap->kvCachePara[jobIdx].roundCnt > varMap->kvCachePara[jobIdx].roundNum)
+    {
+      std::cout << "Successfully finish the " << jobIdx << " Job (Broadcast)" << std::endl;
+      varMap->numOfFinishedJob += 1;
+      return;
+    }
+    NS_LOG_INFO("BROADCAST, JobID: " << jobIdx << ", Round **" << varMap->kvCachePara[jobIdx].roundCnt << "** Starts ");
+
+    varMap->kvCachePara[jobIdx].completeCnt = 0;
+    Ptr<Node> leaderNode = varMap->kvCachePara[jobIdx].leaderNode;
+    Ipv4Address leaderAddr = leaderNode->GetObject<Ipv4>()->GetAddress(1, 0).GetLocal();
+
+    uint64_t delayInNs, flowSizeInByte;
+    uint16_t appPort;
+    if (varMap->kvCachePara[jobIdx].roundCnt != 1)
+    {
+      delayInNs = varMap->kvCachePara[jobIdx].reduceTimeInNs + varMap->kvCachePara[jobIdx].otherTimeInNs;
+    }
+    else
+    {
+      delayInNs = 0;
+    }
+
+    for (uint32_t i = 0; i < varMap->kvCachePara[jobIdx].followerNodes.GetN(); i++)
+    {
+      Ptr<Node> followerNode = varMap->kvCachePara[jobIdx].followerNodes.Get(i);
+      Ipv4Address followerAddr = followerNode->GetObject<Ipv4>()->GetAddress(1, 0).GetLocal();
+      varMap->appStartPort += 1;
+      appPort = varMap->appStartPort;
+      varMap->appPort2kvApp[appPort] = &varMap->kvCachePara[jobIdx];
+      flowSizeInByte = varMap->kvCachePara[jobIdx].querySizeInByte;
+      RdmaClientHelper clientHelper(3, leaderAddr, followerAddr, appPort, appPort, flowSizeInByte, varMap->maxBdpInByte, varMap->maxRttInNs);
+      ApplicationContainer appCon = clientHelper.Install(leaderNode);
+      appCon.Start(NanoSeconds(delayInNs));
+
+      NS_LOG_INFO("QP Pair Index: " << i << ", " << "Leader-->Follower: Job Index: " << jobIdx << ", " << "Type: " << varMap->kvCachePara[jobIdx].type << ", " << "Round: " << varMap->kvCachePara[jobIdx].roundCnt << ", " << "CompleteCnt: " << varMap->kvCachePara[jobIdx].completeCnt << ", " << "srcNode: " << leaderNode->GetId() << ", " << "DstNode: " << followerNode->GetId() << ", " << "appPort: " << appPort << ", " << "flowSizeInByte: " << flowSizeInByte << ", " << "WaitTimeInNs: " << delayInNs);
+    }
+  }
+
+  void iterate_single_ring_kv_cache_application(global_variable_t *varMap, uint32_t jobIdx)
+  {
+
+    varMap->kvCachePara[jobIdx].roundCnt += 1;
+    if (varMap->kvCachePara[jobIdx].roundCnt > varMap->kvCachePara[jobIdx].roundNum)
+    {
+      std::cout << "Successfully finish the " << jobIdx << " Job (Ringcast)" << std::endl;
+      varMap->numOfFinishedJob += 1;
+      return;
+    }
+    NS_LOG_INFO("Start the **" << varMap->kvCachePara[jobIdx].roundCnt << "** round of the **" << jobIdx << "** Job (Ring)");
+
+    varMap->kvCachePara[jobIdx].completeCnt = 0;
+
+    uint64_t delayInNs, flowSizeInByte;
+    uint16_t appPort;
+    if (varMap->kvCachePara[jobIdx].roundCnt != 1)
+    {
+      delayInNs = varMap->kvCachePara[jobIdx].reduceTimeInNs + varMap->kvCachePara[jobIdx].otherTimeInNs;
+    }
+    else
+    {
+      delayInNs = 0;
+    }
+
+    for (uint32_t i = 0; i < varMap->kvCachePara[jobIdx].followerNodes.GetN(); i++)
+    {
+      Ptr<Node> followerNode = varMap->kvCachePara[jobIdx].followerNodes.Get(i);
+      Ipv4Address followerAddr = followerNode->GetObject<Ipv4>()->GetAddress(1, 0).GetLocal();
+      Ptr<Node> leaderNode = varMap->kvCachePara[jobIdx].leaderNodes.Get(i);
+      Ipv4Address leaderAddr = leaderNode->GetObject<Ipv4>()->GetAddress(1, 0).GetLocal();
+      varMap->appStartPort += 1;
+      appPort = varMap->appStartPort;
+      varMap->appPort2kvApp[appPort] = &varMap->kvCachePara[jobIdx];
+      flowSizeInByte = varMap->kvCachePara[jobIdx].attentionSizeInByte;
+      RdmaClientHelper clientHelper(3, leaderAddr, followerAddr, appPort, appPort, flowSizeInByte, varMap->maxBdpInByte, varMap->maxRttInNs);
+      ApplicationContainer appCon = clientHelper.Install(leaderNode);
+      appCon.Start(NanoSeconds(delayInNs));
+
+      NS_LOG_INFO("QP Pair Index: " << i << ", " << "Leader-->Follower: Job Index: " << jobIdx << ", " << "Type: " << varMap->kvCachePara[jobIdx].type << ", " << "Round: " << varMap->kvCachePara[jobIdx].roundCnt << ", " << "CompleteCnt: " << varMap->kvCachePara[jobIdx].completeCnt << ", " << "srcNode: " << leaderNode->GetId() << ", " << "DstNode: " << followerNode->GetId() << ", " << "appPort: " << appPort << ", " << "flowSizeInByte: " << flowSizeInByte << ", " << "WaitTimeInNs: " << delayInNs);
+    }
+  }
+
+  void iterate_single_inca_kv_cache_application(global_variable_t *varMap, uint32_t jobIdx)
+  {
+
+    varMap->kvCachePara[jobIdx].roundCnt += 1;
+    varMap->kvCachePara[jobIdx].completeCnt = 0;
+    if (varMap->kvCachePara[jobIdx].roundCnt > varMap->kvCachePara[jobIdx].roundNum)
+    {
+      std::cout << "Successfully finish the " << jobIdx << " Job (INCA)" << std::endl;
+      varMap->numOfFinishedJob += 1;
+      return;
+    }
+    NS_LOG_INFO("Start the **" << varMap->kvCachePara[jobIdx].roundCnt << "** round of the **" << jobIdx << "** Job (Inca)");
+
+    uint64_t delayInNs, flowSizeInByte = varMap->kvCachePara[jobIdx].querySizeInByte;
+    uint16_t appPort;
+    if (varMap->kvCachePara[jobIdx].roundCnt != 1)
+    {
+      delayInNs = varMap->kvCachePara[jobIdx].otherTimeInNs;
+    }
+    else
+    {
+      delayInNs = 0;
+    }
+
+    for (uint32_t i = 0; i < varMap->kvCachePara[jobIdx].followerNodes.GetN(); i++)
+    {
+      Ptr<Node> leaderNode = varMap->kvCachePara[jobIdx].leaderNodes.Get(i);
+      Ipv4Address leaderAddr = leaderNode->GetObject<Ipv4>()->GetAddress(1, 0).GetLocal();
+      Ptr<Node> followerNode = varMap->kvCachePara[jobIdx].followerNodes.Get(i);
+      Ipv4Address followerAddr = followerNode->GetObject<Ipv4>()->GetAddress(1, 0).GetLocal();
+      varMap->appStartPort += 1;
+      appPort = varMap->appStartPort;
+      varMap->appPort2kvApp[appPort] = &varMap->kvCachePara[jobIdx];
+      RdmaClientHelper clientHelper(3, leaderAddr, followerAddr, appPort, appPort, flowSizeInByte, varMap->maxBdpInByte, varMap->maxRttInNs);
+      ApplicationContainer appCon = clientHelper.Install(leaderNode);
+      appCon.Start(NanoSeconds(delayInNs));
+
+      NS_LOG_INFO("QP Pair Index: " << i << ", " << "Leader-->Follower: Job Index: " << jobIdx << ", " << "Type: " << varMap->kvCachePara[jobIdx].type << ", " << "Round: " << varMap->kvCachePara[jobIdx].roundCnt << ", " << "CompleteCnt: " << varMap->kvCachePara[jobIdx].completeCnt << ", " << "srcNode: " <
