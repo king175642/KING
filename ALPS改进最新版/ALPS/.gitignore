@@ -1,0 +1,12 @@
+build/
+.lock-waf_*
+compile_commands.json
+*.log
+*.pcap
+*.tr
+results/
+.vscode/
+*.swp
+.DS_Store
+# Auto-added by copy script on 2026年 02月 25日 星期三 19:33:22 CST
+laps_share/outputFiles/C000*/

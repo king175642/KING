@@ -1,0 +1,17 @@
+============================================================
+            Path Selection Preference Statistics            
+============================================================
+  Length\LR   |      0.5      |      0.6      |      0.7      |      0.8      |      0.9      |      1.0     
+-------------------------------------------------------------------------------------------------------------
+Shortest Path |   1.739785    |   1.760526    |   1.803403    |   1.831831    |   1.833567    |   1.867656   
+2nd Shortest  |   0.898125    |   0.890830    |   0.882499    |   0.880106    |   0.882612    |   0.873249   
+3rd Shortest  |   0.620376    |   0.614434    |   0.608071    |   0.599574    |   0.592436    |   0.594881   
+4th Shortest  |   0.524702    |   0.505280    |   0.509491    |   0.487377    |   0.490956    |   0.481346   
+============================================================
+
+Explanation:
+- LR: network load ratio
+- Path Selection Preference = (Traffic sent on path K) / Total traffic × Number of candidate paths
+- Random spraying results in preference value of 1.0 for all paths
+- Values > 1.0 indicate path preference, < 1.0 indicate path avoidance
+- N/A indicates path does not exist or data missing
